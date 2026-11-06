@@ -2,6 +2,8 @@
 import asyncio
 import json
 import os
+import queue
+from collections.abc import Sequence
 from contextlib import asynccontextmanager, nullcontext
 from typing import Final
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -17,6 +19,7 @@ from litellm.proxy.mcp_server.mcp_server_manager import (
     MCPServerManager,
     MCPTransport,
 )
+from litellm.types.mcp import MCPAuth
 
 mcp_server_manager = MCPServerManager()
 
@@ -3207,6 +3210,112 @@ async def test_mcp_routing_stashes_only_method_for_auth_and_replays_full_body(me
     assert await _read_request_body(_admission_request(scope)) == (
         {"method": method} if isinstance(method, str) else {}
     )
+
+
+def _docs_server(auth_type: str, legacy_client_credentials: bool = False) -> MCPServer:
+    return MCPServer(
+        server_id="docs-id",
+        name="docs",
+        alias="docs",
+        url="https://upstream.example/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth(auth_type),
+        token_url="https://idp.example/token" if legacy_client_credentials else None,
+        client_id="client" if legacy_client_credentials else None,
+        client_secret="secret" if legacy_client_credentials else None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "selected_servers", "docs", "expected"),
+    [
+        ("tools/list", ["docs"], _docs_server("oauth_delegate"), "reauthorizes"),
+        ("prompts/list", ["docs"], _docs_server("oauth_delegate"), "reauthorizes"),
+        ("resources/list", ["docs"], _docs_server("oauth_delegate"), "reauthorizes"),
+        ("resources/templates/list", ["docs"], _docs_server("oauth_delegate"), "reauthorizes"),
+        ("tools/list", ["DOCS"], _docs_server("oauth_delegate"), "reauthorizes"),
+        ("tools/list", ["docs"], _docs_server("api_key"), "none"),
+        ("tools/list", ["docs"], _docs_server("oauth2", legacy_client_credentials=True), "none"),
+        ("tools/call", ["docs"], _docs_server("oauth_delegate"), "holds"),
+        ("tools/list", ["docs", "wiki"], _docs_server("oauth_delegate"), "none"),
+        ("tools/list", ["unregistered_group"], _docs_server("oauth_delegate"), "none"),
+        ("tools/list", None, _docs_server("oauth_delegate"), "none"),
+        ("ping", ["docs"], _docs_server("oauth_delegate"), "none"),
+    ],
+)
+async def test_mcp_routing_holds_a_single_servers_listing_response_for_a_reauth_challenge(
+    method: str, selected_servers: Sequence[str] | None, docs: MCPServer, expected: str
+) -> None:
+    try:
+        from litellm.proxy.mcp_server.scope_challenge import SCOPE_RESPONSE_KEY, OAuthScopeResponse
+        from litellm.proxy.mcp_server.server import (
+            handle_streamable_http_mcp,
+            session_manager_stateful,
+            session_manager_stateless,
+        )
+    except ImportError:
+        pytest.skip("MCP server not available")
+
+    def gate_kind(gate: object) -> str:
+        if not isinstance(gate, OAuthScopeResponse):
+            return "none"
+        gate.deny_reauth("docs")
+        return "holds" if gate.pending else "reauthorizes"
+
+    from litellm.proxy.mcp_server import operations
+
+    jsonrpc_body: Final = json.dumps({"jsonrpc": "2.0", "id": 2, "method": method, "params": {}}).encode()
+    scope: Final = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [(b"content-type", b"application/json"), (b"authorization", b"Bearer test-key")],
+    }
+    receive: Final = AsyncMock(side_effect=[{"type": "http.request", "body": jsonrpc_body, "more_body": False}])
+    held: Final = queue.SimpleQueue[object]()
+
+    async def stateless_handle(handled_scope: Scope, _receive: Receive, _send: Send) -> None:
+        held.put(handled_scope.get(SCOPE_RESPONSE_KEY))
+
+    with (
+        patch(  # test-quality-ok: the ASGI handler reads auth from a module-level helper; the suite's only seam
+            "litellm.proxy.mcp_server.server.extract_mcp_auth_context",
+            new_callable=AsyncMock,
+            return_value=(MagicMock(), None, selected_servers, None, None, None),
+        ),
+        patch(  # test-quality-ok: registry is empty in unit tests; key owns one server
+            "litellm.proxy.mcp_server.server._get_allowed_mcp_servers",
+            new_callable=AsyncMock,
+            return_value=[MagicMock()],
+        ),
+        patch(  # test-quality-ok: init flag is a module global; no injection seam
+            "litellm.proxy.mcp_server.server._SESSION_MANAGERS_INITIALIZED",
+            True,
+        ),
+        patch.object(  # test-quality-ok: session managers are module-level singletons; the suite's only seam
+            session_manager_stateless, "handle_request", side_effect=stateless_handle
+        ),
+        patch.object(  # test-quality-ok: session managers are module-level singletons; the suite's only seam
+            session_manager_stateful, "handle_request", side_effect=stateless_handle
+        ),
+        patch.object(  # test-quality-ok: the registry is a module-level singleton's attribute; the suite's only seam
+            operations.global_mcp_server_manager, "registry", {docs.server_id: docs}
+        ),
+        patch(  # test-quality-ok: the missing-token challenge runs before the gate and is not under test here
+            "litellm.proxy.mcp_server.server._raise_preemptive_401_for_unauthenticated_servers",
+            new_callable=AsyncMock,
+        ),
+        patch.object(  # test-quality-ok: session managers are module-level singletons; the suite's only seam
+            session_manager_stateless, "_server_instances", {}
+        ),
+        patch.object(  # test-quality-ok: session managers are module-level singletons; the suite's only seam
+            session_manager_stateful, "_server_instances", {}
+        ),
+    ):
+        await handle_streamable_http_mcp(scope, receive, AsyncMock())
+
+    assert gate_kind(held.get_nowait()) == expected
 
 
 @pytest.mark.asyncio
