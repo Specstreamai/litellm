@@ -13,6 +13,7 @@ import inspect
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final, Protocol
+from urllib.parse import urlparse, urlunparse
 
 from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
@@ -771,6 +772,12 @@ def should_redact_message_logging(model_call_details: dict) -> bool:
 
     # Priority 3: Fall back to global setting
     return litellm.turn_off_message_logging is True
+
+
+def url_for_logging(url: str, model_call_details: Mapping[str, object]) -> str:
+    if not should_redact_message_logging(dict(model_call_details)):
+        return url
+    return urlunparse(urlparse(url)._replace(query="", fragment=""))
 
 
 def redact_message_input_output_from_logging(model_call_details: dict, result, input: object | None = None) -> Any:

@@ -80,6 +80,7 @@ from litellm.litellm_core_utils.realtime_errors import (
     websocket_close_reason,
 )
 from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+from litellm.litellm_core_utils.redact_messages import url_for_logging
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment, join_api_base
 from litellm.llms.anthropic.common_utils import merge_anthropic_beta_headers
 from litellm.llms.base_llm.anthropic_messages.transformation import (
@@ -2327,7 +2328,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key,
             additional_args={
                 "complete_input_dict": data,
-                "api_base": complete_url,
+                "api_base": url_for_logging(complete_url, logging_obj.model_call_details),
                 "headers": headers,
             },
         )
@@ -2430,7 +2431,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key,
             additional_args={
                 "complete_input_dict": data,
-                "api_base": complete_url,
+                "api_base": url_for_logging(complete_url, logging_obj.model_call_details),
                 "headers": headers,
             },
         )

@@ -93,7 +93,7 @@ async def _get_search_with_client(
         query="test",
         optional_params={},
         timeout=5,
-        logging_obj=Mock(),
+        logging_obj=Mock(model_call_details={}),
         api_key="test-key",
         api_base="https://search.example.test/",
         custom_llm_provider="tinyfish" if isinstance(provider_config, TinyfishSearchConfig) else "brave",
@@ -172,6 +172,62 @@ async def test_get_search_preserves_tinyfish_http_error_formatting(is_async: boo
             )
             assert error.value.headers is not None
             assert error.value.headers["retry-after"] == "7"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", (False, True))
+@pytest.mark.parametrize("turn_off_message_logging", (False, True))
+async def test_get_search_keeps_query_out_of_logged_url_when_message_logging_is_off(
+    monkeypatch: pytest.MonkeyPatch, is_async: bool, turn_off_message_logging: bool
+) -> None:
+    from datetime import datetime, timezone
+
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    monkeypatch.setattr(litellm, "turn_off_message_logging", turn_off_message_logging)
+    logging_obj: Final = Logging(
+        model="brave",
+        messages=[],
+        stream=False,
+        call_type="asearch" if is_async else "search",
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="search-logged-url",
+        function_id="search-logged-url",
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["q"] == "private medical question"
+        return httpx.Response(200, json={"web": {"results": []}})
+
+    transport: Final = httpx.MockTransport(respond)
+    async with httpx.AsyncClient(transport=transport) as async_client:
+        with httpx.Client(transport=transport) as sync_client:
+            client: Final = AsyncHTTPHandler() if is_async else HTTPHandler(client=sync_client)
+            if isinstance(client, AsyncHTTPHandler):
+                await client.close()
+                client.client = async_client
+            result: Final = BaseLLMHTTPHandler().search(
+                query="private medical question",
+                optional_params={},
+                timeout=5,
+                logging_obj=logging_obj,
+                api_key="test-key",
+                api_base="https://search.example.test/",
+                custom_llm_provider="brave",
+                client=client,
+                asearch=is_async,
+                provider_config=BraveSearchConfig(),
+            )
+            await result if asyncio.iscoroutine(result) else result
+
+    logged_urls: Final = (
+        logging_obj.model_call_details["litellm_params"]["api_base"],
+        logging_obj.model_call_details["additional_args"]["api_base"],
+    )
+    for logged_url in logged_urls:
+        assert ("private" in logged_url) is not turn_off_message_logging
+        assert logged_url.startswith("https://search.example.test/")
 
 
 def test_prepare_fake_stream_request():
